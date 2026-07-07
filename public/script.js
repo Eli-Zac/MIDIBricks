@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id);
 const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 let midiData = null;   // parsed { tracks:[{notes:[{midi,start,end}]}], ppq }
 let noteEvents = null; // flattened melody events for current settings
+let previewTracks = []; // event-arrays for the current selection (audio preview)
 
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 function noteHz(midi){ return 440 * Math.pow(2,(midi-69)/12); }
@@ -190,19 +191,21 @@ return { events, start: e.start };
 // ---------- generate & render ----------
 function generate(){
 if (!midiData) return;
+stopAllPreview();              // settings changed -> stop any stale preview
 const outputs = $("outputs");
 outputs.innerHTML = "";
 const hubCount = clamp(Math.round(+$("hubCount").value) || 1, 1, maxHubs());
 
 if (hubCount <= 1){
   const events = buildEvents(+$("track").value);
-  if (!events.length){ setStatus("No notes found in this file/track."); setRestWarn(0); return; }
+  if (!events.length){ setStatus("No notes found in this file/track."); setRestWarn(0); previewTracks = []; return; }
   noteEvents = events;
+  previewTracks = [events];
   drawViz();
   setRestWarn(events.filter(e=>e.rest).length);
   const ts = +$("track").value;
   const code = renderCode(events, { mode:"single", displayNum: ts >= 0 ? ts + 1 : null });
-  outputs.appendChild(makeOutputPanel({ title:"Generated Pybricks code", code, filename:"melody.py" }));
+  outputs.appendChild(makeOutputPanel({ title:"Generated Pybricks code", code, filename:"melody.py", events }));
   return;
 }
 
@@ -215,18 +218,20 @@ const starts = timelines.filter(t => t.events.length).map(t => t.start);
 const globalStart = starts.length ? Math.min(...starts) : 0;
 
 let totalRest = 0, empties = 0, drewViz = false;
+previewTracks = [];
 timelines.forEach((tl, i) => {
   let events = tl.events;
   const lead = Math.round(tl.start - globalStart);
   if (events.length && lead > 0) events = [{ rest:true, ms:lead }, ...events];
   if (!events.length) empties++;
+  else previewTracks.push(events);
   if (!drewViz && events.length){ noteEvents = events; drawViz(); drewViz = true; }
   totalRest += events.filter(e=>e.rest).length;
   const role = i === 0 ? "leader" : "follower";
   const trackSel = assigns[i];
   const code = renderCode(events, { mode: role, channel: 1, displayNum: trackSel >= 0 ? trackSel + 1 : i + 1 });
   const title = `Hub ${i+1} · ${role === "leader" ? "Leader (start hub)" : "Follower"} · ${trackLabel(trackSel)}`;
-  outputs.appendChild(makeOutputPanel({ title, code, filename:`hub${i+1}_${role}.py` }));
+  outputs.appendChild(makeOutputPanel({ title, code, filename:`hub${i+1}_${role}.py`, events }));
 });
 setRestWarn(totalRest);
 setStatus(`${hubCount} Prime hubs, one track each. Run every follower program first (they wait), then press the leader hub's center button to start them together.` +
@@ -455,9 +460,81 @@ run_task(main())
 return head + "\n" + body;
 }
 
+// ---------- audio preview (square wave ~ the hub buzzer) ----------
+let audioCtx = null;
+let scheduledNodes = [];   // oscillators currently scheduled, so we can stop them
+let endTimer = null;
+let currentStop = null;    // () => void that stops playback + resets its button
+
+function audio(){
+if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+return audioCtx;
+}
+
+function stopAudio(){
+for (const n of scheduledNodes){ try { n.stop(); } catch(e){} }
+scheduledNodes = [];
+if (endTimer){ clearTimeout(endTimer); endTimer = null; }
+}
+
+function stopAllPreview(){
+if (currentStop){ const s = currentStop; currentStop = null; s(); }
+}
+
+// Play several event-arrays at once (tracks play simultaneously, like the hubs).
+function startAudio(tracks, onEnd){
+const ctx = audio();
+if (ctx.state === "suspended") ctx.resume();
+const t0 = ctx.currentTime + 0.06;
+const vol = 0.16 / Math.max(1, Math.sqrt(tracks.length));   // don't clip when mixed
+let end = t0;
+for (const events of tracks){
+  let t = t0;
+  for (const e of events){
+    const dur = Math.max(0.001, e.ms / 1000);
+    if (!e.rest && e.midi != null){
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "square";
+      osc.frequency.value = noteHz(e.midi);
+      const sound = Math.max(0.02, dur - 0.012);   // small gap between notes
+      const a = 0.004;                              // tiny attack/release, no clicks
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(vol, t + a);
+      g.gain.setValueAtTime(vol, Math.max(t + a, t + sound - a));
+      g.gain.linearRampToValueAtTime(0, t + sound);
+      osc.connect(g).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + sound + 0.01);
+      scheduledNodes.push(osc);
+    }
+    t += dur;
+  }
+  if (t > end) end = t;
+}
+endTimer = setTimeout(() => { stopAudio(); if (onEnd) onEnd(); }, (end - ctx.currentTime) * 1000 + 150);
+}
+
+function hasNotes(tracks){ return tracks.some(t => t.some(e => !e.rest && e.midi != null)); }
+
+// Toggle play/stop for a button. tracks = array of event-arrays to play together.
+function togglePreview(btn, tracks, idleHTML, playingHTML){
+const wasThis = currentStop && currentStop.btn === btn;
+stopAllPreview();               // stop anything already playing (and reset its button)
+if (wasThis) return;            // clicking the active button again just stops
+if (!tracks.length || !hasNotes(tracks)) return;
+btn.innerHTML = playingHTML;
+btn.classList.add("playing");
+const reset = () => { btn.innerHTML = idleHTML; btn.classList.remove("playing"); };
+const stop = () => { stopAudio(); reset(); };
+stop.btn = btn;
+currentStop = stop;
+startAudio(tracks, () => { reset(); if (currentStop === stop) currentStop = null; });
+}
+
 // Create a collapsible code output panel. Collapsed by default; click the
 // header (chevron/title) to expand. Copy/Download stay clickable in the header.
-function makeOutputPanel({ title, code, filename }){
+function makeOutputPanel({ title, code, filename, events }){
 const panel = document.createElement("div");
 panel.className = "panel out-panel collapsed";
 
@@ -476,9 +553,12 @@ heading.append(chevron, h);
 
 const btns = document.createElement("div");
 btns.style.cssText = "display:flex;gap:.5rem";
+const PLAY = "🔊", STOP_ICON = "◼";
+const spk = document.createElement("button");
+spk.className = "sec spk"; spk.textContent = PLAY; spk.title = "Play what this track should sound like";
 const copy = document.createElement("button"); copy.className = "sec"; copy.textContent = "Copy";
 const dl = document.createElement("button"); dl.className = "sec"; dl.textContent = "Download .py";
-btns.append(copy, dl);
+btns.append(spk, copy, dl);
 head.append(heading, btns);
 
 const pre = document.createElement("pre");
@@ -492,6 +572,10 @@ head.addEventListener("keydown", (e) => {
 });
 
 // keep the action buttons from toggling the panel
+spk.addEventListener("click", (e) => {
+  e.stopPropagation();
+  togglePreview(spk, [events || []], PLAY, STOP_ICON);
+});
 copy.addEventListener("click", (e) => {
   e.stopPropagation();
   navigator.clipboard.writeText(code);
@@ -654,6 +738,7 @@ const withNotes = midiData.tracks.filter(t=>t.notes.length).length;
 setStatus(`Parsed ${withNotes} track(s) with notes, ${totalNotes} notes total.` +
   (withNotes>1 ? ` Using track ${bestTrack+1} (highest register) as the melody — switch tracks if needed.` : ""));
 $("regen").disabled = false;
+$("preview").disabled = false;
 }
 
 const drop=$("drop"), fileInput=$("file");
@@ -673,3 +758,4 @@ btn._t = setTimeout(() => { btn.classList.remove("ok"); btn.textContent = "Regen
 $("hub").addEventListener("change", ()=>{ if(midiData) updateHubUI(); });
 $("hubCount").addEventListener("input", onHubCountChange);
 $("hubCount").addEventListener("change", onHubCountChange);
+$("preview").addEventListener("click", () => togglePreview($("preview"), previewTracks, "▶ Preview audio", "◼ Stop"));

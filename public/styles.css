@@ -32,6 +32,9 @@ button { background: var(--accent2); color: #05130a; border: none; font-weight: 
 #regen.ok { background: #2ea043; transform: scale(1.03); }
 button:disabled { opacity: .4; cursor: not-allowed; }
 button.sec { background: #21262d; color: var(--text); }
+button.sec.playing { background: var(--accent); color: #04121f; }
+button.sec.spk { padding: .45rem .7rem; font-size: 1rem; line-height: 1; }
+#preview.playing { background: var(--accent); color: #04121f; }
 .status { font-size: .85rem; color: var(--muted); margin-top: .6rem; min-height: 1.2em; }
 canvas { width: 100%; height: 100px; display: block; margin-top: 1rem; border-radius: 6px; background: var(--bg); }
 pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; font-size: .8rem; font-family: "SF Mono", Consolas, monospace; max-height: 380px; margin: 0; }
