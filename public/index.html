@@ -22,55 +22,79 @@
   </div>
 
   <div class="panel">
-    <div class="row">
-      <div class="field">
-        <label>Voice to keep</label>
-        <select id="voice">
-          <option value="high">Highest note (melody)</option>
-          <option value="low">Lowest note (bass)</option>
-        </select>
+    <div class="group">
+      <span class="group-label">Melody</span>
+      <div class="row">
+        <div class="field">
+          <label>Voice to keep</label>
+          <select id="voice">
+            <option value="high">Highest note (melody)</option>
+            <option value="low">Lowest note (bass)</option>
+          </select>
+        </div>
+        <div class="field" id="singleTrackField">
+          <label>Track</label>
+          <select id="track"><option value="-1">All tracks</option></select>
+        </div>
       </div>
-      <div class="field">
-        <label>Track</label>
-        <select id="track"><option value="-1">All tracks</option></select>
+    </div>
+
+    <div class="group">
+      <span class="group-label">Playback</span>
+      <div class="row">
+        <div class="field">
+          <label>Speed (%)</label>
+          <input type="number" id="speed" value="100" min="10" max="400" step="5">
+        </div>
+        <div class="field">
+          <label>Gap between notes (ms)</label>
+          <input type="number" id="gapMs" value="10" min="0" max="200" step="5">
+        </div>
+        <div class="field">
+          <label>Volume (0–100)</label>
+          <input type="number" id="volume" value="100" min="0" max="100" step="5">
+        </div>
       </div>
-      <div class="field">
-        <label>Speed (%)</label>
-        <input type="number" id="speed" value="100" min="10" max="400" step="5">
+    </div>
+
+    <div class="group">
+      <span class="group-label">Hub</span>
+      <div class="row">
+        <div class="field">
+          <label>Hub type</label>
+          <select id="hub">
+            <option>TechnicHub</option>
+            <option>PrimeHub</option>
+            <option>InventorHub</option>
+            <option>MoveHub</option>
+            <option>CityHub</option>
+          </select>
+        </div>
+        <div class="field" id="hubCountField" style="display:none">
+          <label>Number of hubs</label>
+          <input type="number" id="hubCount" value="1" min="1" max="1" step="1">
+        </div>
+        <div class="field" id="syncTrimField" style="display:none">
+          <label>Sync trim (ms)</label>
+          <input type="number" id="syncTrim" value="-200" min="-2000" max="2000" step="25">
+        </div>
       </div>
-      <div class="field">
-        <label>Gap between notes (ms)</label>
-        <input type="number" id="gapMs" value="10" min="0" max="200" step="5">
-      </div>
-      <div class="field">
-        <label>Volume (0–100)</label>
-        <input type="number" id="volume" value="100" min="0" max="100" step="5">
-      </div>
-      <div class="field">
-        <label>Hub</label>
-        <select id="hub">
-          <option>TechnicHub</option>
-          <option>PrimeHub</option>
-          <option>InventorHub</option>
-          <option>MoveHub</option>
-          <option>CityHub</option>
-        </select>
-      </div>
+      <div class="muted-s" id="multiHint" style="display:none">Multiple hubs stay in sync over Bluetooth — each plays one track. Available on Prime / Inventor hubs. The leader is the master clock and followers re-align to it continuously, so they won't drift over a long song. Each hub shows its track number on its screen. <strong>Sync trim</strong> (default −200) pulls followers forward to cancel BLE broadcast latency — make it more negative if followers lag, less if they run ahead.</div>
+    </div>
+
+    <div id="assignRow" style="display:none">
+      <span class="group-label">Track for each hub</span>
+      <div id="assign" class="row"></div>
+      <div class="muted-s" id="assignHint">Hub 1 is the leader: run the follower hubs first, then press the leader hub's center button to start them all together. Press it again to stop every hub.</div>
+    </div>
+
+    <div class="row action-row">
       <button id="regen" disabled>Regenerate</button>
     </div>
     <div class="warn" id="restWarn"></div>
   </div>
 
-  <div class="panel" id="outPanel" style="display:none">
-    <div class="code-head">
-      <h2>Generated Pybricks code</h2>
-      <div style="display:flex;gap:.5rem">
-        <button class="sec" id="copyBtn">Copy</button>
-        <button class="sec" id="dlBtn">Download .py</button>
-      </div>
-    </div>
-    <pre id="out"></pre>
-  </div>
+  <div id="outputs"></div>
 </div>
 
 <script src="script.js"></script>

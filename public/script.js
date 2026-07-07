@@ -106,10 +106,12 @@ return (tick) => {
 }
 
 // ---------- flatten to a monophonic melody ----------
-function flatten(){
-if (!midiData) return;
+// trackSel: a track index, or -1 for "all tracks mixed"
+// Returns { events, start } where start is the absolute ms of the first onset
+// (used to align tracks that enter at different times across multiple hubs).
+function flatten(trackSel){
+if (!midiData) return { events: [], start: 0 };
 const voice = $("voice").value;   // high | low
-const trackSel = +$("track").value;
 const speed = clamp(+$("speed").value, 10, 400)/100;
 const tickToMs = buildTickToMs(midiData.ppq, midiData.tempos);
 
@@ -121,7 +123,7 @@ midiData.tracks.forEach((tr,i)=>{
     all.push({ midi:n.midi, start: tickToMs(n.start)/speed, end: tickToMs(n.end)/speed });
   }
 });
-if (!all.length){ noteEvents=[]; return; }
+if (!all.length) return { events: [], start: 0 };
 all.sort((a,b)=>a.start-b.start || a.midi-b.midi);
 
 // Onset grid: group notes that begin at (nearly) the same time. Notes within
@@ -161,26 +163,87 @@ for (let i=0;i<onsets.length;i++){
     events.push({ midi:pick.midi, ms:dur, rest:false });
   }
 }
-noteEvents = events;
+return { events, start: onsets.length ? onsets[0].t : 0 };
 }
 
-function round(x){ return Math.round(x); }
+// single hub: trim leading AND trailing rests (no one to stay aligned with)
+function buildEvents(trackSel){
+const e = flatten(trackSel).events;
+while (e.length && e[0].rest) e.shift();
+while (e.length && e[e.length-1].rest) e.pop();
+return e;
+}
+
+// multi hub: keep the absolute start so tracks entering at different times
+// can be aligned to a common musical zero. Trim only trailing silence.
+function buildTimeline(trackSel){
+const e = flatten(trackSel);
+const events = e.events.slice();
+while (events.length && events[events.length-1].rest) events.pop();
+return { events, start: e.start };
+}
 
 // ---------- generate & render ----------
 function generate(){
-flatten();
-if (!noteEvents || !noteEvents.length){ setStatus("No notes found in this file/track."); return; }
-// drop leading rest and trailing rest
-while (noteEvents.length && noteEvents[0].rest) noteEvents.shift();
-while (noteEvents.length && noteEvents[noteEvents.length-1].rest) noteEvents.pop();
-drawViz();
-renderCode(noteEvents);
+if (!midiData) return;
+const outputs = $("outputs");
+outputs.innerHTML = "";
+const hubCount = clamp(Math.round(+$("hubCount").value) || 1, 1, maxHubs());
+
+if (hubCount <= 1){
+  const events = buildEvents(+$("track").value);
+  if (!events.length){ setStatus("No notes found in this file/track."); setRestWarn(0); return; }
+  noteEvents = events;
+  drawViz();
+  setRestWarn(events.filter(e=>e.rest).length);
+  const ts = +$("track").value;
+  const code = renderCode(events, { mode:"single", displayNum: ts >= 0 ? ts + 1 : null });
+  outputs.appendChild(makeOutputPanel({ title:"Generated Pybricks code", code, filename:"melody.py" }));
+  return;
 }
 
-function renderCode(events){
+// --- multi-hub: one track per hub, kept in sync over BLE ---
+const assigns = readAssignments(hubCount);
+// Align every track to a common musical zero so a part that enters later
+// keeps its lead-in silence instead of starting immediately.
+const timelines = assigns.map(buildTimeline);
+const starts = timelines.filter(t => t.events.length).map(t => t.start);
+const globalStart = starts.length ? Math.min(...starts) : 0;
+
+let totalRest = 0, empties = 0, drewViz = false;
+timelines.forEach((tl, i) => {
+  let events = tl.events;
+  const lead = Math.round(tl.start - globalStart);
+  if (events.length && lead > 0) events = [{ rest:true, ms:lead }, ...events];
+  if (!events.length) empties++;
+  if (!drewViz && events.length){ noteEvents = events; drawViz(); drewViz = true; }
+  totalRest += events.filter(e=>e.rest).length;
+  const role = i === 0 ? "leader" : "follower";
+  const trackSel = assigns[i];
+  const code = renderCode(events, { mode: role, channel: 1, displayNum: trackSel >= 0 ? trackSel + 1 : i + 1 });
+  const title = `Hub ${i+1} · ${role === "leader" ? "Leader (start hub)" : "Follower"} · ${trackLabel(trackSel)}`;
+  outputs.appendChild(makeOutputPanel({ title, code, filename:`hub${i+1}_${role}.py` }));
+});
+setRestWarn(totalRest);
+setStatus(`${hubCount} Prime hubs, one track each. Run every follower program first (they wait), then press the leader hub's center button to start them together.` +
+  (empties ? ` Note: ${empties} assigned track(s) had no notes.` : ""));
+}
+
+// Build one hub's Pybricks program. opts.mode: "single" | "leader" | "follower".
+function renderCode(events, opts){
 const hub = $("hub").value;
 const gap = clamp(+$("gapMs").value || 0, 0, 200);
 const vol = clamp(Math.round(+$("volume").value), 0, 100);
+const mode = opts.mode || "single";
+const channel = opts.channel || 1;
+// Sync trim: how many ms a follower stays behind the leader's clock, to fill
+// the BLE/audio latency. +ve = follower later, -ve = follower earlier. With
+// continuous re-sync this only sets the constant offset; drift is handled.
+const trim = clamp(Math.round(+$("syncTrim").value) || 0, -2000, 2000);
+// Track number to show on the hub's light matrix (Prime/Inventor only).
+const hasDisplay = hub === "PrimeHub" || hub === "InventorHub";
+const displayNum = (hasDisplay && opts.displayNum != null) ? opts.displayNum : null;
+const displayLine = displayNum != null ? `hub.display.number(${displayNum})   # show this hub's track number\n` : "";
 
 const seen = new Map();
 for (const e of events) if (!e.rest && !seen.has(e.midi)){
@@ -198,37 +261,323 @@ const lines = [];
 for (let i=0;i<tuples.length;i+=6) lines.push("    " + tuples.slice(i,i+6).join(", ") + ",");
 if (lines.length) lines[lines.length-1] = lines[lines.length-1].replace(/,$/,"");
 
-const restCount = events.filter(e=>e.rest).length;
-$("restWarn").textContent = restCount ? `${restCount} rest(s) become silent pauses (frequency 0).` : "";
+const notesBlock =
+`# Note frequencies (Hz)
+${constLines.join("\n")}
 
-const code =
+# (frequency, duration_ms)  -- frequency 0 = silent pause
+melody = [
+${lines.join("\n")}
+]`;
+
+// --- single hub: plain blocking playback ---
+if (mode === "single"){
+  return (
 `from pybricks.hubs import ${hub}
 from pybricks.tools import wait
 
 # Auto-generated from a MIDI file
 hub = ${hub}()
 hub.speaker.volume(${vol})
-
-# Note frequencies (Hz)
-${constLines.join("\n")}
-
-# (frequency, duration_ms)  -- frequency 0 = silent pause
-melody = [
-${lines.join("\n")}
-]
+${displayLine}
+${notesBlock}
 
 print("Playing melody...")
 for frequency, duration in melody:
-  if frequency == 0:
-      wait(duration)
-  else:
-      hub.speaker.beep(frequency, duration)
-  wait(${gap})  # small gap between notes
+    if frequency == 0:
+        wait(duration)
+    else:
+        hub.speaker.beep(frequency, duration)
+    wait(${gap})  # small gap between notes
 
 wait(500)
+`);
+}
+
+// --- multi hub: async so playback and the stop-watcher run together ---
+// Protocol on the BLE channel: broadcast 1 = "start", STOP = "everyone stop".
+// The radio moved from hub.ble to pybricks.messaging in Pybricks 4.0, so the
+// setup tries the new module and falls back to hub.ble on older firmware.
+const isLeader = mode === "leader";
+let imports = `from pybricks.hubs import ${hub}\nfrom pybricks.tools import wait, multitask, run_task, StopWatch`;
+if (isLeader) imports += `\nfrom pybricks.parameters import Button`;
+
+const radioSetup = isLeader ?
+`CHANNEL = ${channel}
+try:
+    from pybricks.messaging import BLERadio   # Pybricks 4.0+
+    hub = ${hub}()
+    _radio = BLERadio(broadcast_channel=CHANNEL)
+    def signal(value):
+        _radio.broadcast(value)
+except ImportError:
+    hub = ${hub}(broadcast_channel=CHANNEL)   # older firmware
+    def signal(value):
+        hub.ble.broadcast(value)` :
+`CHANNEL = ${channel}
+try:
+    from pybricks.messaging import BLERadio   # Pybricks 4.0+
+    hub = ${hub}()
+    _radio = BLERadio(observe_channels=[CHANNEL])
+    def look():
+        return _radio.observe(CHANNEL)
+except ImportError:
+    hub = ${hub}(observe_channels=[CHANNEL])   # older firmware
+    def look():
+        return hub.ble.observe(CHANNEL)`;
+
+const head =
+`${imports}
+
+# Auto-generated from a MIDI file
+${radioSetup}
+hub.speaker.volume(${vol})
+${displayLine}
+${notesBlock}
+
+STOP = -1     # broadcast value meaning "everyone stop now"
+GAP = ${gap}       # silence between notes -- taken out of the note, NOT added to
+                   # the timeline, so every bar lands on the exact same beat
+clock = StopWatch()
+
+async def play():
+    # pos() is where the music SHOULD be right now (the shared clock). Every note
+    # is pinned to it. If we run late (e.g. a slow low-frequency beep), we shorten
+    # the note -- or skip it entirely if its slot has already passed -- so we snap
+    # back onto the beat instead of falling behind and never catching up.
+    t = 0
+    for frequency, duration in melody:
+        if pos() < t + duration:         # slot not fully in the past -> play it
+            while pos() < t:             # not our moment yet -> wait for it
+                await wait(1)
+            if frequency != 0:
+                remaining = t + duration - pos() - GAP   # only the time still ahead of us
+                if remaining > 0:
+                    await hub.speaker.beep(frequency, remaining)
+        t += duration                    # always advance the schedule by the true length
 `;
-$("out").textContent = code;
-$("outPanel").style.display = "block";
+
+const body = isLeader ?
+`SYNC = 100     # broadcast our position this often (ms) so followers can track us
+
+def pos():
+    return clock.time()    # the leader IS the master clock
+
+async def report():
+    # The leader is the master clock: keep telling the followers our exact
+    # position so they re-align every SYNC ms and never drift apart.
+    while True:
+        signal(clock.time())
+        await wait(SYNC)
+
+# The center button is normally the STOP button, which would kill this
+# program. Move "stop" to the Bluetooth button so the center button is
+# free to start (and later stop) playback. Press Bluetooth for a hard stop.
+hub.system.set_stop_button(Button.BLUETOOTH)
+
+async def wait_center():
+    while Button.CENTER not in hub.buttons.pressed():
+        await wait(10)
+    while Button.CENTER in hub.buttons.pressed():   # wait for release
+        await wait(10)
+    return True
+
+async def main():
+    # --- LEADER hub: run every follower first, then press this hub's center
+    # --- button to start all hubs. Press it again to stop them all.
+    print("Press the center button to start all hubs.")
+    await wait_center()
+    clock.reset()
+    print("Playing melody...")
+    # Play + broadcast position, stopping when the melody ends or center is pressed.
+    results = await multitask(play(), report(), wait_center(), race=True)
+    if results[2]:         # center pressed -> stop the followers immediately
+        signal(STOP)
+        await wait(300)
+    signal(None)           # stop broadcasting (followers finish their own track)
+    await wait(500)
+
+run_task(main())
+` :
+`TRIM = ${trim}      # stay this many ms behind the leader's clock (BLE latency)
+STEP = 4         # max ms we nudge per correction -- keeps steering gentle & smooth
+offset = [0]     # our position = clock.time() + offset[0]
+ref = [0]        # leader position captured at our start (shared zero)
+locked = [False] # have we done the initial hard lock yet?
+
+def pos():
+    return clock.time() + offset[0]   # our position on the leader's clock
+
+async def follow():
+    # Our own clock is smooth; the leader's reported position is stale and jittery.
+    # So we lock onto it ONCE at the start, then only steer by tiny steps to cancel
+    # slow crystal drift. Hard-snapping every reading is what caused the stutter.
+    while True:
+        data = look()
+        if data == STOP:
+            return
+        if data is not None and data >= 0:
+            error = (data - ref[0] - TRIM) - (clock.time() + offset[0])
+            if not locked[0]:
+                offset[0] += error          # snap into sync once
+                locked[0] = True
+            elif error > STEP:
+                offset[0] += STEP           # else creep toward it, never jump
+            elif error < -STEP:
+                offset[0] -= STEP
+            else:
+                offset[0] += error
+        await wait(250)   # correct gently, a few times a second is plenty
+
+async def main():
+    # --- FOLLOWER hub: run this, then press the leader hub's center button.
+    print("Waiting for the leader hub...")
+    while True:
+        d = look()
+        if d is not None and d >= 0:      # first position broadcast = go
+            break
+        await wait(10)
+    clock.reset()
+    ref[0] = d               # leader's position now is our zero
+    offset[0] = -TRIM        # start TRIM ms behind to fill the BLE latency
+    print("Playing melody...")
+    # Play + track the leader, stopping when it says STOP or our track ends.
+    await multitask(play(), follow(), race=True)
+    await wait(500)
+
+run_task(main())
+`;
+
+return head + "\n" + body;
+}
+
+// Create a collapsible code output panel. Collapsed by default; click the
+// header (chevron/title) to expand. Copy/Download stay clickable in the header.
+function makeOutputPanel({ title, code, filename }){
+const panel = document.createElement("div");
+panel.className = "panel out-panel collapsed";
+
+const head = document.createElement("div");
+head.className = "code-head out-toggle";
+head.setAttribute("role", "button");
+head.setAttribute("tabindex", "0");
+
+const heading = document.createElement("div");
+heading.className = "out-heading";
+const chevron = document.createElement("span");
+chevron.className = "chevron"; chevron.textContent = "▶";   // ▶
+const h = document.createElement("h2");
+h.textContent = title;
+heading.append(chevron, h);
+
+const btns = document.createElement("div");
+btns.style.cssText = "display:flex;gap:.5rem";
+const copy = document.createElement("button"); copy.className = "sec"; copy.textContent = "Copy";
+const dl = document.createElement("button"); dl.className = "sec"; dl.textContent = "Download .py";
+btns.append(copy, dl);
+head.append(heading, btns);
+
+const pre = document.createElement("pre");
+pre.textContent = code;
+panel.append(head, pre);
+
+const toggle = () => panel.classList.toggle("collapsed");
+head.addEventListener("click", toggle);
+head.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " "){ e.preventDefault(); toggle(); }
+});
+
+// keep the action buttons from toggling the panel
+copy.addEventListener("click", (e) => {
+  e.stopPropagation();
+  navigator.clipboard.writeText(code);
+  copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1200);
+});
+dl.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const blob = new Blob([code], { type:"text/x-python" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+});
+return panel;
+}
+
+function setRestWarn(n){
+$("restWarn").textContent = n ? `${n} rest(s) become silent pauses (frequency 0).` : "";
+}
+
+// ---------- multi-hub track assignment ----------
+let trackInfos = [];   // [{ i, count, avg }] for tracks that have notes
+let defaultOrder = []; // track indices, melody-ish (highest register) first
+
+function maxHubs(){ return Math.max(1, trackInfos.length); }
+
+function trackLabel(trackSel){
+if (trackSel === -1) return "All tracks";
+const info = trackInfos.find(t => t.i === trackSel);
+return `Track ${trackSel+1}` + (info ? ` (${info.count} notes)` : "");
+}
+
+// (re)build the per-hub track dropdowns for the current hub count
+function buildAssignUI(hubCount){
+const wrap = $("assign");
+wrap.innerHTML = "";
+for (let i=0;i<hubCount;i++){
+  const field = document.createElement("div");
+  field.className = "field";
+  const label = document.createElement("label");
+  label.textContent = `Hub ${i+1}` + (i === 0 ? " (leader)" : "");
+  const sel = document.createElement("select");
+  trackInfos.forEach(t => {
+    const o = document.createElement("option");
+    o.value = t.i; o.textContent = `Track ${t.i+1} (${t.count} notes)`;
+    sel.appendChild(o);
+  });
+  // default: give each hub a distinct track, melody-ish tracks first
+  sel.value = String(defaultOrder[i % defaultOrder.length]);
+  sel.addEventListener("change", () => { if (midiData) generate(); });
+  field.append(label, sel);
+  wrap.appendChild(field);
+}
+}
+
+function readAssignments(hubCount){
+const sels = [...$("assign").querySelectorAll("select")];
+const out = [];
+for (let i=0;i<hubCount;i++){
+  out.push(sels[i] ? +sels[i].value : defaultOrder[i % defaultOrder.length]);
+}
+return out;
+}
+
+function onHubCountChange(){
+const n = clamp(Math.round(+$("hubCount").value) || 1, 1, maxHubs());
+$("hubCount").value = String(n);
+const multi = n > 1;
+$("assignRow").style.display = multi ? "block" : "none";
+$("singleTrackField").style.display = multi ? "none" : "";
+updateSyncTrimVisibility();
+if (multi) buildAssignUI(n);
+if (midiData) generate();
+}
+
+// Only Prime / Inventor hubs get the multi-hub (BLE sync) option.
+function isMultiCapable(){
+const h = $("hub").value;
+return h === "PrimeHub" || h === "InventorHub";
+}
+
+function updateHubUI(){
+const capable = isMultiCapable();
+$("hubCountField").style.display = capable ? "" : "none";
+$("multiHint").style.display = capable ? "block" : "none";
+if (!capable) $("hubCount").value = "1";   // force single-hub for non-BLE hubs
+onHubCountChange();
+}
+
+// the sync-trim field only matters when there are 2+ hubs
+function updateSyncTrimVisibility(){
+const multi = isMultiCapable() && clamp(Math.round(+$("hubCount").value) || 1, 1, maxHubs()) > 1;
+$("syncTrimField").style.display = multi ? "" : "none";
 }
 
 // ---------- viz (piano-roll of the extracted melody) ----------
@@ -281,12 +630,26 @@ midiData.tracks.forEach((tr,i)=>{
 });
 // default to the melody track, not the mashed-together "all tracks"
 if (bestTrack !== -1) sel.value = String(bestTrack);
+
+// multi-hub state: which tracks have notes, ordered melody-first for defaults
+trackInfos = [];
+midiData.tracks.forEach((tr,i)=>{
+  if (tr.notes.length){
+    trackInfos.push({ i, count: tr.notes.length, avg: tr.notes.reduce((s,n)=>s+n.midi,0)/tr.notes.length });
+  }
+});
+defaultOrder = trackInfos.slice().sort((a,b)=>b.avg-a.avg).map(t=>t.i);
+$("hubCount").max = String(maxHubs());
+$("hubCount").value = "1";                 // start single-hub on every new file
+$("assignRow").style.display = "none";
+$("singleTrackField").style.display = "";
+updateHubUI();                             // sync hub-count visibility to hub type
+
 const totalNotes = midiData.tracks.reduce((s,t)=>s+t.notes.length,0);
 const withNotes = midiData.tracks.filter(t=>t.notes.length).length;
 setStatus(`Parsed ${withNotes} track(s) with notes, ${totalNotes} notes total.` +
   (withNotes>1 ? ` Using track ${bestTrack+1} (highest register) as the melody — switch tracks if needed.` : ""));
 $("regen").disabled = false;
-generate();
 }
 
 const drop=$("drop"), fileInput=$("file");
@@ -294,10 +657,15 @@ const drop=$("drop"), fileInput=$("file");
 ["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("over");}));
 drop.addEventListener("drop",ev=>{ const f=ev.dataTransfer.files[0]; if(f) handle(f); });
 fileInput.addEventListener("change",ev=>{ const f=ev.target.files[0]; if(f) handle(f); });
-$("regen").addEventListener("click", generate);
-["voice","track","speed","gapMs","volume","hub"].forEach(id=>$(id).addEventListener("change", ()=>{ if(midiData) generate(); }));
-$("copyBtn").addEventListener("click",()=>{ navigator.clipboard.writeText($("out").textContent); $("copyBtn").textContent="Copied"; setTimeout(()=>$("copyBtn").textContent="Copy",1200); });
-$("dlBtn").addEventListener("click",()=>{
-const blob=new Blob([$("out").textContent],{type:"text/x-python"});
-const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="melody.py"; a.click();
+$("regen").addEventListener("click", () => {
+const btn = $("regen");
+generate();
+btn.classList.add("ok");
+btn.textContent = "Regenerated ✓";
+clearTimeout(btn._t);
+btn._t = setTimeout(() => { btn.classList.remove("ok"); btn.textContent = "Regenerate"; }, 1200);
 });
+["voice","track","speed","gapMs","volume","syncTrim"].forEach(id=>$(id).addEventListener("change", ()=>{ if(midiData) generate(); }));
+$("hub").addEventListener("change", ()=>{ if(midiData) updateHubUI(); });
+$("hubCount").addEventListener("input", onHubCountChange);
+$("hubCount").addEventListener("change", onHubCountChange);
