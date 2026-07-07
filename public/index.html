@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pybricks MIDI → Notes Generator</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>Pybricks MIDI → Notes Generator</h1>
+  <p class="sub">Upload a <code class="inline">.mid</code> file. It extracts the melody line and emits a <code class="inline">beep</code> sequence for a Pybricks hub speaker.</p>
+
+  <div class="panel">
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".mid,.midi,audio/midi,audio/x-midi">
+      <svg id="dropIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      <div id="dropText"><strong>Drop a MIDI file</strong> or click to browse<br><span class="muted-s">.mid / .midi — a single-melody track works best</span></div>
+    </label>
+    <div class="status" id="status"></div>
+    <canvas id="viz" class="hidden"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <div class="field">
+        <label>Voice to keep</label>
+        <select id="voice">
+          <option value="high">Highest note (melody)</option>
+          <option value="low">Lowest note (bass)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Track</label>
+        <select id="track"><option value="-1">All tracks</option></select>
+      </div>
+      <div class="field">
+        <label>Speed (%)</label>
+        <input type="number" id="speed" value="100" min="10" max="400" step="5">
+      </div>
+      <div class="field">
+        <label>Gap between notes (ms)</label>
+        <input type="number" id="gapMs" value="10" min="0" max="200" step="5">
+      </div>
+      <div class="field">
+        <label>Volume (0–100)</label>
+        <input type="number" id="volume" value="100" min="0" max="100" step="5">
+      </div>
+      <div class="field">
+        <label>Hub</label>
+        <select id="hub">
+          <option>TechnicHub</option>
+          <option>PrimeHub</option>
+          <option>InventorHub</option>
+          <option>MoveHub</option>
+          <option>CityHub</option>
+        </select>
+      </div>
+      <button id="regen" disabled>Regenerate</button>
+    </div>
+    <div class="warn" id="restWarn"></div>
+  </div>
+
+  <div class="panel" id="outPanel" style="display:none">
+    <div class="code-head">
+      <h2>Generated Pybricks code</h2>
+      <div style="display:flex;gap:.5rem">
+        <button class="sec" id="copyBtn">Copy</button>
+        <button class="sec" id="dlBtn">Download .py</button>
+      </div>
+    </div>
+    <pre id="out"></pre>
+  </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
