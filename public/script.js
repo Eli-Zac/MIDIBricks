@@ -107,9 +107,11 @@ return (tick) => {
 
 // ---------- flatten to a monophonic melody ----------
 // trackSel: a track index, or -1 for "all tracks mixed"
+// capRests: cap long silences (nice for a lone melody). MUST be false for
+// multi-hub, or capping desyncs the tracks by shortening their timelines.
 // Returns { events, start } where start is the absolute ms of the first onset
 // (used to align tracks that enter at different times across multiple hubs).
-function flatten(trackSel){
+function flatten(trackSel, capRests = true){
 if (!midiData) return { events: [], start: 0 };
 const voice = $("voice").value;   // high | low
 const speed = clamp(+$("speed").value, 10, 400)/100;
@@ -138,7 +140,7 @@ for (const n of all){
 
 // For each onset pick the melody voice (highest or lowest sounding note).
 const events = [];
-const RESTCAP = 700; // never emit a silence longer than this (ms)
+const RESTCAP = capRests ? 700 : Infinity; // never emit a silence longer than this (ms)
 for (let i=0;i<onsets.length;i++){
   const o = onsets[i];
   let pick = o.notes[0];
@@ -176,8 +178,10 @@ return e;
 
 // multi hub: keep the absolute start so tracks entering at different times
 // can be aligned to a common musical zero. Trim only trailing silence.
+// Rests are NOT capped here -- every track must keep its true timeline or the
+// hubs drift apart (a capped rest makes that track finish its bar too early).
 function buildTimeline(trackSel){
-const e = flatten(trackSel);
+const e = flatten(trackSel, false);
 const events = e.events.slice();
 while (events.length && events[events.length-1].rest) events.pop();
 return { events, start: e.start };
