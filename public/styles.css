@@ -59,3 +59,8 @@ pre { background: var(--code-bg); border: 1px solid var(--border); border-radius
 #multiHint { margin-top: .55rem; }
 .action-row { border-top: 1px solid var(--border2); padding-top: 1rem; }
 code.inline { background: var(--border2); padding: .1rem .35rem; border-radius: 4px; font-size: .85em; }
+.site-footer { display: flex; flex-direction: column; align-items: center; gap: .6rem; margin-top: 2.5rem; padding-top: 2rem; border-top: 1px solid var(--border2); }
+.gh-btn { display: inline-flex; align-items: center; gap: .5rem; background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: .85rem; font-weight: 600; padding: .55rem 1.1rem; border-radius: 999px; text-decoration: none; transition: border-color .15s, background .15s, transform .1s; }
+.gh-btn:hover { border-color: var(--accent); background: #1c2128; transform: translateY(-1px); }
+.gh-btn svg { flex: none; }
+.gh-by { color: var(--muted); font-size: .75rem; }
