@@ -217,7 +217,7 @@ const timelines = assigns.map(buildTimeline);
 const starts = timelines.filter(t => t.events.length).map(t => t.start);
 const globalStart = starts.length ? Math.min(...starts) : 0;
 
-let totalRest = 0, empties = 0, drewViz = false;
+let totalRest = 0, empties = 0;
 previewTracks = [];
 timelines.forEach((tl, i) => {
   let events = tl.events;
@@ -225,7 +225,6 @@ timelines.forEach((tl, i) => {
   if (events.length && lead > 0) events = [{ rest:true, ms:lead }, ...events];
   if (!events.length) empties++;
   else previewTracks.push(events);
-  if (!drewViz && events.length){ noteEvents = events; drawViz(); drewViz = true; }
   totalRest += events.filter(e=>e.rest).length;
   const role = i === 0 ? "leader" : "follower";
   const trackSel = assigns[i];
@@ -233,6 +232,7 @@ timelines.forEach((tl, i) => {
   const title = `Hub ${i+1} · ${role === "leader" ? "Leader (start hub)" : "Follower"} · ${trackLabel(trackSel)}`;
   outputs.appendChild(makeOutputPanel({ title, code, filename:`hub${i+1}_${role}.py`, events }));
 });
+drawViz();          // show every hub's track together, aligned on one timeline
 setRestWarn(totalRest);
 setStatus(`${hubCount} Prime hubs, one track each. Run every follower program first (they wait), then press the leader hub's center button to start them together.` +
   (empties ? ` Note: ${empties} assigned track(s) had no notes.` : ""));
@@ -249,6 +249,10 @@ const channel = opts.channel || 1;
 // the BLE/audio latency. +ve = follower later, -ve = follower earlier. With
 // continuous re-sync this only sets the constant offset; drift is handled.
 const trim = clamp(Math.round(+$("syncTrim").value) || 0, -2000, 2000);
+// Countdown (seconds -> ms) before the first note. The leader counts this down
+// on its display while every hub locks onto the shared clock, so playback starts
+// already in sync instead of drifting for the first few seconds.
+const lead = clamp(Math.round(+$("countdownSec").value) || 0, 0, 10) * 1000;
 // Track number to show on the hub's light matrix (Prime/Inventor only).
 const hasDisplay = hub === "PrimeHub" || hub === "InventorHub";
 const displayNum = (hasDisplay && opts.displayNum != null) ? opts.displayNum : null;
@@ -364,20 +368,53 @@ async def play():
                 if remaining > 0:
                     await hub.speaker.beep(frequency, remaining)
         t += duration                    # always advance the schedule by the true length
+
+# Pixels around the edge of the 5x5 light matrix, in a loop, for the "playing"
+# animation. A little comet travels the border so you can see a hub is live.
+_EDGE = [(0,0),(0,1),(0,2),(0,3),(0,4),(1,4),(2,4),(3,4),
+         (4,4),(4,3),(4,2),(4,1),(4,0),(3,0),(2,0),(1,0)]
+
+async def spin():
+    # Loops forever (the race in main() cancels it when playback ends). Lights the
+    # leading pixel and clears the one 3 steps back -> a moving 3-4 pixel comet.
+    hub.display.off()
+    i = 0
+    while True:
+        r, c = _EDGE[i % len(_EDGE)]
+        hub.display.pixel(r, c, 100)
+        pr, pc = _EDGE[(i - 3) % len(_EDGE)]
+        hub.display.pixel(pr, pc, 0)
+        i += 1
+        await wait(80)
 `;
 
 const body = isLeader ?
 `SYNC = 100     # broadcast our position this often (ms) so followers can track us
+LEAD = ${lead}    # countdown before the first note (ms). The clock starts now, so
+                   # followers lock onto it during the countdown and begin in sync.
 
 def pos():
-    return clock.time()    # the leader IS the master clock
+    return clock.time() - LEAD    # music position; negative during the countdown
 
 async def report():
     # The leader is the master clock: keep telling the followers our exact
-    # position so they re-align every SYNC ms and never drift apart.
+    # position so they re-align every SYNC ms and never drift apart. Broadcasting
+    # starts during the countdown so followers pre-sync before the first note.
     while True:
         signal(clock.time())
         await wait(SYNC)
+
+async def show():
+    # Count down on the display, then switch to the "playing" animation once the
+    # first note is due (pos() >= 0). Every hub shows the animation together.
+    last = -1
+    while pos() < 0:
+        n = (-pos() + 999) // 1000       # seconds remaining, rounded up
+        if n != last:
+            hub.display.number(n)
+            last = n
+        await wait(50)
+    await spin()
 
 # The center button is normally the STOP button, which would kill this
 # program. Move "stop" to the Bluetooth button so the center button is
@@ -396,11 +433,12 @@ async def main():
     # --- button to start all hubs. Press it again to stop them all.
     print("Press the center button to start all hubs.")
     await wait_center()
-    clock.reset()
-    print("Playing melody...")
-    # Play + broadcast position, stopping when the melody ends or center is pressed.
-    results = await multitask(play(), report(), wait_center(), race=True)
-    if results[2]:         # center pressed -> stop the followers immediately
+    clock.reset()          # t=0 is the START of the countdown, not the first note
+    print("Counting down...")
+    # Play + broadcast position + countdown/animation, stopping when the melody
+    # ends or the center button is pressed again.
+    results = await multitask(play(), report(), show(), wait_center(), race=True)
+    if results[3]:         # center pressed -> stop the followers immediately
         signal(STOP)
         await wait(300)
     signal(None)           # stop broadcasting (followers finish their own track)
@@ -409,13 +447,14 @@ async def main():
 run_task(main())
 ` :
 `TRIM = ${trim}      # stay this many ms behind the leader's clock (BLE latency)
+LEAD = ${lead}     # countdown before the first note (ms) -- matches the leader
 STEP = 4         # max ms we nudge per correction -- keeps steering gentle & smooth
 offset = [0]     # our position = clock.time() + offset[0]
 ref = [0]        # leader position captured at our start (shared zero)
 locked = [False] # have we done the initial hard lock yet?
 
 def pos():
-    return clock.time() + offset[0]   # our position on the leader's clock
+    return clock.time() + offset[0] - LEAD   # music position on the leader's clock
 
 async def follow():
     # Our own clock is smooth; the leader's reported position is stale and jittery.
@@ -438,6 +477,13 @@ async def follow():
                 offset[0] += error
         await wait(250)   # correct gently, a few times a second is plenty
 
+async def show():
+    # Stay dark through the leader's countdown, then run the same "playing"
+    # animation as every other hub once the first note is due.
+    while pos() < 0:
+        await wait(50)
+    await spin()
+
 async def main():
     # --- FOLLOWER hub: run this, then press the leader hub's center button.
     print("Waiting for the leader hub...")
@@ -446,12 +492,13 @@ async def main():
         if d is not None and d >= 0:      # first position broadcast = go
             break
         await wait(10)
+    hub.display.off()        # leader has started the countdown -> stop showing our track number
     clock.reset()
     ref[0] = d               # leader's position now is our zero
     offset[0] = -TRIM        # start TRIM ms behind to fill the BLE latency
-    print("Playing melody...")
-    # Play + track the leader, stopping when it says STOP or our track ends.
-    await multitask(play(), follow(), race=True)
+    print("Counting down with the leader...")
+    # Play + track the leader + animate, stopping when it says STOP or our track ends.
+    await multitask(play(), follow(), show(), race=True)
     await wait(500)
 
 run_task(main())
@@ -662,33 +709,50 @@ if (!capable) $("hubCount").value = "1";   // force single-hub for non-BLE hubs
 onHubCountChange();
 }
 
-// the sync-trim field only matters when there are 2+ hubs
+// the sync-trim and countdown fields only matter when there are 2+ hubs
 function updateSyncTrimVisibility(){
 const multi = isMultiCapable() && clamp(Math.round(+$("hubCount").value) || 1, 1, maxHubs()) > 1;
 $("syncTrimField").style.display = multi ? "" : "none";
+$("countdownField").style.display = multi ? "" : "none";
 }
 
 // ---------- viz (piano-roll of the extracted melody) ----------
+// Piano-roll of every track being previewed, overlaid on one shared timeline.
+// In multi-hub mode this shows all hubs' parts together (each a different colour),
+// aligned exactly as they play; in single-hub mode it's just the one track.
+const VIZ_COLORS = ["#3fb950","#58a6ff","#d29922","#db61a2","#a371f7","#f0883e"];
 function drawViz(){
 const c = $("viz"); c.classList.remove("hidden");
 const dpr = window.devicePixelRatio||1;
 const w = c.clientWidth, h = 100;
 c.width=w*dpr; c.height=h*dpr;
 const g=c.getContext("2d"); g.scale(dpr,dpr); g.clearRect(0,0,w,h);
-const ev = noteEvents.filter(e=>!e.rest);
-if(!ev.length) return;
-const total = noteEvents.reduce((s,e)=>s+e.ms,0);
-const lo = Math.min(...ev.map(e=>e.midi)), hi = Math.max(...ev.map(e=>e.midi));
-let x=0;
-g.fillStyle="#3fb950";
-for (const e of noteEvents){
-  const bw = (e.ms/total)*w;
-  if(!e.rest){
-    const y = h - ((e.midi-lo)/((hi-lo)||1))*(h-12) - 6;
-    g.fillRect(x, y-3, Math.max(bw-1,1), 6);
-  }
-  x += bw;
+
+const tracks = (previewTracks && previewTracks.length) ? previewTracks
+             : (noteEvents ? [noteEvents] : []);
+// pitch range and time span across ALL tracks so they share one grid
+let lo = Infinity, hi = -Infinity, total = 0;
+for (const ev of tracks){
+  let dur = 0;
+  for (const e of ev){ dur += e.ms; if(!e.rest){ if(e.midi<lo)lo=e.midi; if(e.midi>hi)hi=e.midi; } }
+  if (dur > total) total = dur;
 }
+if(!isFinite(lo) || !total) return;
+
+g.globalAlpha = tracks.length > 1 ? 0.8 : 1;   // let overlapping parts show through
+tracks.forEach((ev, ti) => {
+  g.fillStyle = VIZ_COLORS[ti % VIZ_COLORS.length];
+  let x = 0;
+  for (const e of ev){
+    const bw = (e.ms/total)*w;
+    if(!e.rest){
+      const y = h - ((e.midi-lo)/((hi-lo)||1))*(h-12) - 6;
+      g.fillRect(x, y-3, Math.max(bw-1,1), 6);
+    }
+    x += bw;
+  }
+});
+g.globalAlpha = 1;
 }
 
 function setStatus(t){ $("status").textContent = t; }
@@ -754,7 +818,7 @@ btn.textContent = "Regenerated ✓";
 clearTimeout(btn._t);
 btn._t = setTimeout(() => { btn.classList.remove("ok"); btn.textContent = "Regenerate"; }, 1200);
 });
-["voice","track","speed","gapMs","volume","syncTrim"].forEach(id=>$(id).addEventListener("change", ()=>{ if(midiData) generate(); }));
+["voice","track","speed","gapMs","volume","syncTrim","countdownSec"].forEach(id=>$(id).addEventListener("change", ()=>{ if(midiData) generate(); }));
 $("hub").addEventListener("change", ()=>{ if(midiData) updateHubUI(); });
 $("hubCount").addEventListener("input", onHubCountChange);
 $("hubCount").addEventListener("change", onHubCountChange);

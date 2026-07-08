@@ -76,10 +76,14 @@
         </div>
         <div class="field" id="syncTrimField" style="display:none">
           <label>Sync trim (ms)</label>
-          <input type="number" id="syncTrim" value="-200" min="-2000" max="2000" step="25">
+          <input type="number" id="syncTrim" value="-100" min="-2000" max="2000" step="25">
+        </div>
+        <div class="field" id="countdownField" style="display:none">
+          <label>Countdown (s)</label>
+          <input type="number" id="countdownSec" value="3" min="0" max="10" step="1">
         </div>
       </div>
-      <div class="muted-s" id="multiHint" style="display:none">Multiple hubs stay in sync over Bluetooth — each plays one track. Available on Prime / Inventor hubs. The leader is the master clock and followers re-align to it continuously, so they won't drift over a long song. Each hub shows its track number on its screen. <strong>Sync trim</strong> (default −200) pulls followers forward to cancel BLE broadcast latency — make it more negative if followers lag, less if they run ahead.</div>
+      <div class="muted-s" id="multiHint" style="display:none">Multiple hubs stay in sync over Bluetooth — each plays one track. Available on Prime / Inventor hubs. The leader is the master clock and followers re-align to it continuously, so they won't drift over a long song. Each hub shows its track number on its screen. <strong>Sync trim</strong> (default −100) pulls followers forward to cancel BLE broadcast latency — make it more negative if followers lag, less if they run ahead. <strong>Countdown</strong> (default 3&nbsp;s) runs after you press start: the leader counts down while every hub locks onto the shared clock, so they begin the first note already in sync — then all hubs show a "playing" light animation.</div>
     </div>
 
     <div id="assignRow" style="display:none">
