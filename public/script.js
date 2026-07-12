@@ -508,33 +508,25 @@ return head + "\n" + body;
 }
 
 // ---------- audio preview (square wave ~ the hub buzzer) ----------
+// Notes are bounced to a single AudioBuffer via OfflineAudioContext first, then
+// played back as one buffer. Scheduling a live oscillator+gain node per note on
+// the real-time context (the old approach) meant thousands of live nodes for a
+// multi-track song, which is what caused audible lag/glitching past ~7 tracks.
+// Offline rendering does all that synth work up front, off the realtime thread.
 let audioCtx = null;
-let scheduledNodes = [];   // oscillators currently scheduled, so we can stop them
-let endTimer = null;
-let currentStop = null;    // () => void that stops playback + resets its button
+let playSourceNode = null;   // the single AudioBufferSourceNode currently playing
+let currentStop = null;      // () => void that stops playback + resets its button
+let renderCache = null;      // { tracks, buffer } -- avoids re-rendering the same tracks
 
 function audio(){
 if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 return audioCtx;
 }
 
-function stopAudio(){
-for (const n of scheduledNodes){ try { n.stop(); } catch(e){} }
-scheduledNodes = [];
-if (endTimer){ clearTimeout(endTimer); endTimer = null; }
-}
-
-function stopAllPreview(){
-if (currentStop){ const s = currentStop; currentStop = null; s(); }
-}
-
-// Play several event-arrays at once (tracks play simultaneously, like the hubs).
-function startAudio(tracks, onEnd){
-const ctx = audio();
-if (ctx.state === "suspended") ctx.resume();
-const t0 = ctx.currentTime + 0.06;
+// Schedule the square-wave synth notes for every track into any BaseAudioContext
+// (a live AudioContext, or an OfflineAudioContext for bounce/export).
+function scheduleTracks(ctx, tracks, t0){
 const vol = 0.16 / Math.max(1, Math.sqrt(tracks.length));   // don't clip when mixed
-let end = t0;
 for (const events of tracks){
   let t = t0;
   for (const e of events){
@@ -553,30 +545,129 @@ for (const events of tracks){
       osc.connect(g).connect(ctx.destination);
       osc.start(t);
       osc.stop(t + sound + 0.01);
-      scheduledNodes.push(osc);
     }
     t += dur;
   }
-  if (t > end) end = t;
 }
-endTimer = setTimeout(() => { stopAudio(); if (onEnd) onEnd(); }, (end - ctx.currentTime) * 1000 + 150);
+}
+
+// Bounce the given tracks down to a single AudioBuffer. Cached by reference so
+// replaying (or exporting right after previewing) doesn't re-render.
+async function renderTracks(tracks){
+if (renderCache && renderCache.tracks === tracks) return renderCache.buffer;
+const sampleRate = 44100;
+const t0 = 0.02;
+const totalMs = tracks.reduce((m, ev) => Math.max(m, ev.reduce((s,e)=>s+e.ms, 0)), 0);
+const lengthSec = t0 + totalMs / 1000 + 0.05;   // pad for the last note's release tail
+const ctx = new OfflineAudioContext(2, Math.ceil(lengthSec * sampleRate), sampleRate);
+scheduleTracks(ctx, tracks, t0);
+const buffer = await ctx.startRendering();
+renderCache = { tracks, buffer };
+return buffer;
+}
+
+function playBuffer(buffer, onEnd){
+const ctx = audio();
+if (ctx.state === "suspended") ctx.resume();
+const src = ctx.createBufferSource();
+src.buffer = buffer;
+src.connect(ctx.destination);
+playSourceNode = src;
+src.onended = () => { if (playSourceNode === src){ playSourceNode = null; if (onEnd) onEnd(); } };
+src.start();
+}
+
+function stopAudio(){
+if (playSourceNode){
+  try { playSourceNode.onended = null; playSourceNode.stop(); } catch(e){}
+  playSourceNode = null;
+}
+}
+
+function stopAllPreview(){
+if (currentStop){ const s = currentStop; currentStop = null; s(); }
 }
 
 function hasNotes(tracks){ return tracks.some(t => t.some(e => !e.rest && e.midi != null)); }
 
 // Toggle play/stop for a button. tracks = array of event-arrays to play together.
-function togglePreview(btn, tracks, idleHTML, playingHTML){
+async function togglePreview(btn, tracks, idleHTML, playingHTML){
 const wasThis = currentStop && currentStop.btn === btn;
 stopAllPreview();               // stop anything already playing (and reset its button)
 if (wasThis) return;            // clicking the active button again just stops
 if (!tracks.length || !hasNotes(tracks)) return;
-btn.innerHTML = playingHTML;
+
+btn.innerHTML = "⏳ Loading…";
 btn.classList.add("playing");
 const reset = () => { btn.innerHTML = idleHTML; btn.classList.remove("playing"); };
 const stop = () => { stopAudio(); reset(); };
 stop.btn = btn;
-currentStop = stop;
-startAudio(tracks, () => { reset(); if (currentStop === stop) currentStop = null; });
+currentStop = stop;             // set before awaiting so stop/regenerate can cancel a pending render
+
+let buffer;
+try { buffer = await renderTracks(tracks); }
+catch(e){ if (currentStop === stop){ currentStop = null; reset(); } return; }
+if (currentStop !== stop) return;   // stopped, or superseded by another click, while rendering
+
+btn.innerHTML = playingHTML;
+playBuffer(buffer, () => { reset(); if (currentStop === stop) currentStop = null; });
+}
+
+// ---------- WAV export ----------
+function audioBufferToWav(buffer){
+const numCh = buffer.numberOfChannels;
+const sampleRate = buffer.sampleRate;
+const numFrames = buffer.length;
+const blockAlign = numCh * 2;
+const dataSize = numFrames * blockAlign;
+const out = new ArrayBuffer(44 + dataSize);
+const view = new DataView(out);
+const writeStr = (o,s) => { for (let i=0;i<s.length;i++) view.setUint8(o+i, s.charCodeAt(i)); };
+
+writeStr(0, "RIFF");
+view.setUint32(4, 36 + dataSize, true);
+writeStr(8, "WAVE");
+writeStr(12, "fmt ");
+view.setUint32(16, 16, true);                    // PCM chunk size
+view.setUint16(20, 1, true);                      // PCM format
+view.setUint16(22, numCh, true);
+view.setUint32(24, sampleRate, true);
+view.setUint32(28, sampleRate * blockAlign, true); // byte rate
+view.setUint16(32, blockAlign, true);
+view.setUint16(34, 16, true);                     // bits per sample
+writeStr(36, "data");
+view.setUint32(40, dataSize, true);
+
+const chData = []; for (let c=0;c<numCh;c++) chData.push(buffer.getChannelData(c));
+let offset = 44;
+for (let i=0;i<numFrames;i++){
+  for (let c=0;c<numCh;c++){
+    const s = Math.max(-1, Math.min(1, chData[c][i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+}
+return new Blob([out], { type: "audio/wav" });
+}
+
+async function exportWav(){
+if (!previewTracks.length || !hasNotes(previewTracks)) return;
+const btn = $("exportWav");
+const original = btn.textContent;
+btn.disabled = true;
+btn.textContent = "Rendering…";
+try {
+  const buffer = await renderTracks(previewTracks);
+  const blob = audioBufferToWav(buffer);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "midibricks-preview.wav";
+  a.click();
+  URL.revokeObjectURL(a.href);
+} finally {
+  btn.disabled = false;
+  btn.textContent = original;
+}
 }
 
 // Create a collapsible code output panel. Collapsed by default; click the
@@ -803,6 +894,7 @@ setStatus(`Parsed ${withNotes} track(s) with notes, ${totalNotes} notes total.` 
   (withNotes>1 ? ` Using track ${bestTrack+1} (highest register) as the melody — switch tracks if needed.` : ""));
 $("regen").disabled = false;
 $("preview").disabled = false;
+$("exportWav").disabled = false;
 }
 
 const drop=$("drop"), fileInput=$("file");
@@ -823,3 +915,4 @@ $("hub").addEventListener("change", ()=>{ if(midiData) updateHubUI(); });
 $("hubCount").addEventListener("input", onHubCountChange);
 $("hubCount").addEventListener("change", onHubCountChange);
 $("preview").addEventListener("click", () => togglePreview($("preview"), previewTracks, "▶ Preview audio", "◼ Stop"));
+$("exportWav").addEventListener("click", exportWav);
