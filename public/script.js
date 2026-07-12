@@ -526,6 +526,26 @@ let playSourceNode = null;   // the single AudioBufferSourceNode currently playi
 let currentStop = null;      // () => void that stops playback + resets its button
 let renderCache = null;      // { tracks, buffer } -- avoids re-rendering the same tracks
 
+// Playhead/seek state for the MAIN "Preview audio" button only (per-track spk
+// buttons in the code panels aren't tracked here -- the viz chart always shows
+// the combined multi-track timeline, so the seek bar follows that one).
+let vizTotalSec = 0;          // duration of the current combined preview timeline
+let seekSec = 0;              // playhead position; persists across stop (pause-like)
+let mainBuffer = null;        // the AudioBuffer currently loaded for the main preview
+let mainOnEndCb = null;       // onEnd callback to reuse when a seek restarts the source
+let playStartCtxTime = null;  // ctx.currentTime when mainBuffer last started/resumed
+let playStartOffsetSec = 0;   // seekSec at that moment
+let vizRafId = null;
+let vizDragging = false;
+
+function isMainPlaying(){ return playStartCtxTime != null; }
+
+function currentMainSec(){
+if (!isMainPlaying()) return seekSec;
+const ctx = audio();
+return clamp(playStartOffsetSec + (ctx.currentTime - playStartCtxTime), 0, vizTotalSec);
+}
+
 function audio(){
 if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 return audioCtx;
@@ -616,15 +636,21 @@ btn.innerHTML =
   `</span>`;
 }
 
-function playBuffer(buffer, onEnd){
+// Starts (or restarts, for a seek) playback of a buffer from offsetSec. Returns
+// the ctx time / offset the source actually started at, so callers can track a
+// playhead position against ctx.currentTime.
+function playBuffer(buffer, onEnd, offsetSec){
 const ctx = audio();
 if (ctx.state === "suspended") ctx.resume();
+const off = clamp(offsetSec || 0, 0, buffer.duration);
 const src = ctx.createBufferSource();
 src.buffer = buffer;
 src.connect(ctx.destination);
 playSourceNode = src;
 src.onended = () => { if (playSourceNode === src){ playSourceNode = null; if (onEnd) onEnd(); } };
-src.start();
+const startCtxTime = ctx.currentTime;
+src.start(startCtxTime, off);
+return { startCtxTime, offset: off };
 }
 
 function stopAudio(){
@@ -641,7 +667,10 @@ if (currentStop){ const s = currentStop; currentStop = null; s(); }
 function hasNotes(tracks){ return tracks.some(t => t.some(e => !e.rest && e.midi != null)); }
 
 // Toggle play/stop for a button. tracks = array of event-arrays to play together.
+// The main "Preview audio" button additionally drives the viz chart's playhead
+// and seek bar (see the viz section below); per-track spk buttons don't.
 async function togglePreview(btn, tracks, idleHTML, playingHTML){
+const isMain = btn === $("preview");
 const wasThis = currentStop && currentStop.btn === btn;
 stopAllPreview();               // stop anything already playing (and reset its button)
 if (wasThis) return;            // clicking the active button again just stops
@@ -650,7 +679,12 @@ if (!tracks.length || !hasNotes(tracks)) return;
 btn.classList.add("playing");
 setBtnProgress(btn, "Loading", 0);
 const reset = () => { btn.classList.remove("has-progress"); btn.innerHTML = idleHTML; btn.classList.remove("playing"); };
-const stop = () => { stopAudio(); reset(); };
+const stop = () => {
+  if (isMain && isMainPlaying()) seekSec = currentMainSec();   // pause in place, not reset to 0
+  stopAudio();
+  if (isMain){ playStartCtxTime = null; mainBuffer = null; stopVizLoop(); renderVizFrame(seekSec); updateVizTimeLabel(seekSec); }
+  reset();
+};
 stop.btn = btn;
 currentStop = stop;             // set before awaiting so stop/regenerate can cancel a pending render
 
@@ -661,7 +695,22 @@ if (currentStop !== stop) return;   // stopped, or superseded by another click, 
 
 btn.classList.remove("has-progress");
 btn.innerHTML = playingHTML;
-playBuffer(buffer, () => { reset(); if (currentStop === stop) currentStop = null; });
+
+const onEnd = () => {
+  if (isMain){ seekSec = 0; playStartCtxTime = null; mainBuffer = null; stopVizLoop(); renderVizFrame(0); updateVizTimeLabel(0); }
+  reset();
+  if (currentStop === stop) currentStop = null;
+};
+if (isMain){
+  mainBuffer = buffer;
+  mainOnEndCb = onEnd;
+  const info = playBuffer(buffer, onEnd, seekSec);   // resume from wherever it was last paused/sought
+  playStartCtxTime = info.startCtxTime;
+  playStartOffsetSec = info.offset;
+  startVizLoop();
+} else {
+  playBuffer(buffer, onEnd, 0);
+}
 }
 
 // ---------- WAV export ----------
@@ -863,13 +912,23 @@ $("countdownField").style.display = multi ? "" : "none";
 // Piano-roll of every track being previewed, overlaid on one shared timeline.
 // In multi-hub mode this shows all hubs' parts together (each a different colour),
 // aligned exactly as they play; in single-hub mode it's just the one track.
+//
+// The piano-roll itself is drawn once into an offscreen canvas (vizBaseCanvas)
+// and cached; playback then just redraws that cached image plus a thin playhead
+// line every frame, which is cheap enough to run smoothly at 60fps without
+// recomputing hundreds of note rectangles on every tick. The bar is draggable:
+// dragging only moves the visual playhead (so scrubbing stays glitch-free), and
+// releasing commits the seek -- restarting the live buffer at that position if
+// the main preview is currently playing.
 const VIZ_COLORS = ["#3fb950","#58a6ff","#d29922","#db61a2","#a371f7","#f0883e"];
+let vizBaseCanvas = null;   // offscreen cache of the piano-roll pixels, no playhead
+
 function drawViz(){
 const c = $("viz"); c.classList.remove("hidden");
+$("vizTime").classList.remove("hidden");
 const dpr = window.devicePixelRatio||1;
 const w = c.clientWidth, h = 100;
 c.width=w*dpr; c.height=h*dpr;
-const g=c.getContext("2d"); g.scale(dpr,dpr); g.clearRect(0,0,w,h);
 
 const tracks = (previewTracks && previewTracks.length) ? previewTracks
              : (noteEvents ? [noteEvents] : []);
@@ -880,8 +939,12 @@ for (const ev of tracks){
   for (const e of ev){ dur += e.ms; if(!e.rest){ if(e.midi<lo)lo=e.midi; if(e.midi>hi)hi=e.midi; } }
   if (dur > total) total = dur;
 }
-if(!isFinite(lo) || !total) return;
+if(!isFinite(lo) || !total){ vizBaseCanvas = null; vizTotalSec = 0; return; }
 
+const off = document.createElement("canvas");
+off.width = c.width; off.height = c.height;
+const g = off.getContext("2d");
+g.scale(dpr,dpr);
 g.globalAlpha = tracks.length > 1 ? 0.8 : 1;   // let overlapping parts show through
 tracks.forEach((ev, ti) => {
   g.fillStyle = VIZ_COLORS[ti % VIZ_COLORS.length];
@@ -896,7 +959,113 @@ tracks.forEach((ev, ti) => {
   }
 });
 g.globalAlpha = 1;
+
+vizBaseCanvas = off;
+vizTotalSec = total / 1000;
+seekSec = clamp(seekSec, 0, vizTotalSec);   // keep any existing seek position valid
+renderVizFrame(currentMainSec());
+updateVizTimeLabel(currentMainSec());
 }
+
+function fmtTime(sec){
+sec = Math.max(0, Math.round(sec));
+const m = Math.floor(sec/60), s = sec%60;
+return `${m}:${String(s).padStart(2,"0")}`;
+}
+
+function updateVizTimeLabel(sec){
+$("vizTime").textContent = `${fmtTime(sec)} / ${fmtTime(vizTotalSec)}`;
+}
+
+// Redraws the cached piano-roll plus a playhead line at the given position.
+function renderVizFrame(sec){
+const c = $("viz");
+if (!vizBaseCanvas) return;
+const g = c.getContext("2d");
+g.setTransform(1,0,0,1,0,0);
+g.clearRect(0,0,c.width,c.height);
+g.drawImage(vizBaseCanvas, 0, 0);   // 1:1 device-pixel copy of the cached roll
+
+const dpr = window.devicePixelRatio||1;
+g.scale(dpr,dpr);
+const w = c.width/dpr, h = c.height/dpr;
+const x = vizTotalSec ? clamp((sec/vizTotalSec)*w, 0, w) : 0;
+g.strokeStyle = "#f0f6fc";
+g.lineWidth = 2;
+g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke();
+g.fillStyle = "#f0f6fc";
+g.beginPath(); g.moveTo(x-5,0); g.lineTo(x+5,0); g.lineTo(x,7); g.closePath(); g.fill();
+}
+
+function stopVizLoop(){
+if (vizRafId){ cancelAnimationFrame(vizRafId); vizRafId = null; }
+}
+
+function vizLoop(){
+if (!vizDragging){
+  const sec = currentMainSec();
+  renderVizFrame(sec);
+  updateVizTimeLabel(sec);
+}
+if (isMainPlaying()) vizRafId = requestAnimationFrame(vizLoop);
+else vizRafId = null;
+}
+
+function startVizLoop(){
+stopVizLoop();
+vizLoop();
+}
+
+function vizFracFromEvent(e){
+const c = $("viz");
+const rect = c.getBoundingClientRect();
+return rect.width ? clamp((e.clientX - rect.left) / rect.width, 0, 1) : 0;
+}
+
+// Drag-move: update the visual playhead + time only, so scrubbing never
+// restarts the audio node on every pointermove (that would click/glitch).
+function updateSeekVisualFromEvent(e){
+if (!vizTotalSec) return;
+seekSec = clamp(vizFracFromEvent(e) * vizTotalSec, 0, vizTotalSec);
+renderVizFrame(seekSec);
+updateVizTimeLabel(seekSec);
+}
+
+// Drag-release (or a plain click): commit the seek -- if the main preview is
+// currently playing, restart its buffer at the new position; otherwise just
+// remember it as where the next Play should start from.
+function commitSeek(){
+if (!vizTotalSec) return;
+if (isMainPlaying() && mainBuffer){
+  if (playSourceNode){ try { playSourceNode.onended = null; playSourceNode.stop(); } catch(e){} playSourceNode = null; }
+  const info = playBuffer(mainBuffer, mainOnEndCb, seekSec);
+  playStartCtxTime = info.startCtxTime;
+  playStartOffsetSec = info.offset;
+}
+renderVizFrame(seekSec);
+updateVizTimeLabel(seekSec);
+}
+
+(() => {
+const c = $("viz");
+c.addEventListener("pointerdown", (e) => {
+  if (!vizTotalSec) return;
+  vizDragging = true;
+  c.classList.add("dragging");
+  c.setPointerCapture(e.pointerId);
+  updateSeekVisualFromEvent(e);
+});
+c.addEventListener("pointermove", (e) => { if (vizDragging) updateSeekVisualFromEvent(e); });
+const endDrag = (e) => {
+  if (!vizDragging) return;
+  vizDragging = false;
+  c.classList.remove("dragging");
+  updateSeekVisualFromEvent(e);
+  commitSeek();
+};
+c.addEventListener("pointerup", endDrag);
+c.addEventListener("pointercancel", () => { vizDragging = false; c.classList.remove("dragging"); });
+})();
 
 function setStatus(t){ $("status").textContent = t; }
 
