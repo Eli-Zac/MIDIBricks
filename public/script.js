@@ -508,11 +508,19 @@ return head + "\n" + body;
 }
 
 // ---------- audio preview (square wave ~ the hub buzzer) ----------
-// Notes are bounced to a single AudioBuffer via OfflineAudioContext first, then
-// played back as one buffer. Scheduling a live oscillator+gain node per note on
-// the real-time context (the old approach) meant thousands of live nodes for a
-// multi-track song, which is what caused audible lag/glitching past ~7 tracks.
-// Offline rendering does all that synth work up front, off the realtime thread.
+// Notes are bounced to a single AudioBuffer up front, then played back as one
+// buffer -- so playback cost no longer depends on track/note count, which is
+// what caused audible lag/glitching past ~7 tracks with the old approach
+// (a live OscillatorNode+GainNode per note per track on the real-time context).
+//
+// The bounce itself writes square-wave samples directly into a typed array
+// instead of going through a Web Audio graph (OfflineAudioContext + one
+// oscillator node per note): a real multi-track song can have thousands of
+// notes, and Web Audio's per-node graph-processing overhead turned out to
+// scale badly with node count even offline (a 10-track/150-note-per-track
+// song took ~9s to bounce, and a 12-track/400-note-per-track song didn't
+// finish in 40s). Direct sample synthesis is O(total sounding note-time) with
+// no graph overhead, so it stays fast regardless of track/note count.
 let audioCtx = null;
 let playSourceNode = null;   // the single AudioBufferSourceNode currently playing
 let currentStop = null;      // () => void that stops playback + resets its button
@@ -523,47 +531,86 @@ if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)
 return audioCtx;
 }
 
-// Schedule the square-wave synth notes for every track into any BaseAudioContext
-// (a live AudioContext, or an OfflineAudioContext for bounce/export).
-function scheduleTracks(ctx, tracks, t0){
-const vol = 0.16 / Math.max(1, Math.sqrt(tracks.length));   // don't clip when mixed
-for (const events of tracks){
-  let t = t0;
-  for (const e of events){
-    const dur = Math.max(0.001, e.ms / 1000);
-    if (!e.rest && e.midi != null){
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = "square";
-      osc.frequency.value = noteHz(e.midi);
-      const sound = Math.max(0.02, dur - 0.012);   // small gap between notes
-      const a = 0.004;                              // tiny attack/release, no clicks
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(vol, t + a);
-      g.gain.setValueAtTime(vol, Math.max(t + a, t + sound - a));
-      g.gain.linearRampToValueAtTime(0, t + sound);
-      osc.connect(g).connect(ctx.destination);
-      osc.start(t);
-      osc.stop(t + sound + 0.01);
-    }
-    t += dur;
-  }
+// Bounce the given tracks down to a single (stereo) AudioBuffer of square-wave
+// notes. Cached by reference so replaying (or exporting right after previewing)
+// doesn't re-render. onProgress(0..1), if given, is called periodically as notes
+// are synthesized; the loop yields to the event loop between chunks so a big
+// render doesn't freeze the tab.
+async function renderTracks(tracks, onProgress){
+if (renderCache && renderCache.tracks === tracks){
+  if (onProgress) onProgress(1);
+  return renderCache.buffer;
 }
-}
-
-// Bounce the given tracks down to a single AudioBuffer. Cached by reference so
-// replaying (or exporting right after previewing) doesn't re-render.
-async function renderTracks(tracks){
-if (renderCache && renderCache.tracks === tracks) return renderCache.buffer;
 const sampleRate = 44100;
 const t0 = 0.02;
 const totalMs = tracks.reduce((m, ev) => Math.max(m, ev.reduce((s,e)=>s+e.ms, 0)), 0);
 const lengthSec = t0 + totalMs / 1000 + 0.05;   // pad for the last note's release tail
-const ctx = new OfflineAudioContext(2, Math.ceil(lengthSec * sampleRate), sampleRate);
-scheduleTracks(ctx, tracks, t0);
-const buffer = await ctx.startRendering();
+const numFrames = Math.max(1, Math.ceil(lengthSec * sampleRate));
+const data = new Float32Array(numFrames);
+const vol = 0.16 / Math.max(1, Math.sqrt(tracks.length));   // don't clip when mixed
+
+// Flatten every track to a plain list of notes so we can chunk the synth work
+// and yield periodically, independent of how many tracks they came from.
+const notes = [];
+for (const events of tracks){
+  let t = t0;
+  for (const e of events){
+    const dur = Math.max(0.001, e.ms / 1000);
+    if (!e.rest && e.midi != null) notes.push({ t, dur, midi: e.midi });
+    t += dur;
+  }
+}
+
+const CHUNK = 200;   // notes per chunk before yielding to the event loop
+for (let i = 0; i < notes.length; i++){
+  const { t, dur, midi } = notes[i];
+  const freq = noteHz(midi);
+  const sound = Math.max(0.02, dur - 0.012);   // small gap between notes
+  const a = 0.004;                              // tiny attack/release, no clicks
+  const startFrame = Math.max(0, Math.round(t * sampleRate));
+  const endFrame = Math.min(numFrames, Math.round((t + sound) * sampleRate));
+  const period = sampleRate / freq;
+  for (let f = startFrame; f < endFrame; f++){
+    const localSec = (f - startFrame) / sampleRate;
+    let env = 1;
+    if (localSec < a) env = localSec / a;
+    else if (localSec > sound - a) env = Math.max(0, (sound - localSec) / a);
+    const phase = ((f - startFrame) % period) / period;
+    data[f] += (phase < 0.5 ? 1 : -1) * env * vol;
+  }
+  if (onProgress && (i % CHUNK === CHUNK - 1 || i === notes.length - 1)){
+    onProgress((i + 1) / notes.length);
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+if (!notes.length && onProgress) onProgress(1);
+
+for (let f = 0; f < numFrames; f++) data[f] = Math.max(-1, Math.min(1, data[f]));
+
+const buffer = new AudioBuffer({ length: numFrames, numberOfChannels: 2, sampleRate });
+buffer.copyToChannel(data, 0);
+buffer.copyToChannel(data, 1);
 renderCache = { tracks, buffer };
 return buffer;
+}
+
+// Render a button's content as "<label> <ring with pct in the middle>". Used
+// while a render is in flight so the user can see it's working, not stuck.
+// Small icon-only buttons (the per-track "spk" speaker buttons) skip the label
+// and just show the ring, so they don't balloon in width.
+function setBtnProgress(btn, label, pct){
+const p = Math.max(0, Math.min(100, Math.round(pct)));
+btn.classList.add("has-progress");
+const compact = btn.classList.contains("spk");
+btn.innerHTML =
+  (compact ? "" : `<span class="btn-label">${label}</span>`) +
+  `<span class="btn-ring" style="--p:${p}">` +
+    `<svg viewBox="0 0 36 36" aria-hidden="true">` +
+      `<circle class="ring-bg" cx="18" cy="18" r="15.9155"/>` +
+      `<circle class="ring-fg" cx="18" cy="18" r="15.9155"/>` +
+    `</svg>` +
+    `<span class="btn-ring-pct">${p}</span>` +
+  `</span>`;
 }
 
 function playBuffer(buffer, onEnd){
@@ -597,18 +644,19 @@ stopAllPreview();               // stop anything already playing (and reset its 
 if (wasThis) return;            // clicking the active button again just stops
 if (!tracks.length || !hasNotes(tracks)) return;
 
-btn.innerHTML = "⏳ Loading…";
 btn.classList.add("playing");
-const reset = () => { btn.innerHTML = idleHTML; btn.classList.remove("playing"); };
+setBtnProgress(btn, "Loading", 0);
+const reset = () => { btn.classList.remove("has-progress"); btn.innerHTML = idleHTML; btn.classList.remove("playing"); };
 const stop = () => { stopAudio(); reset(); };
 stop.btn = btn;
 currentStop = stop;             // set before awaiting so stop/regenerate can cancel a pending render
 
 let buffer;
-try { buffer = await renderTracks(tracks); }
+try { buffer = await renderTracks(tracks, pct => { if (currentStop === stop) setBtnProgress(btn, "Loading", pct * 100); }); }
 catch(e){ if (currentStop === stop){ currentStop = null; reset(); } return; }
 if (currentStop !== stop) return;   // stopped, or superseded by another click, while rendering
 
+btn.classList.remove("has-progress");
 btn.innerHTML = playingHTML;
 playBuffer(buffer, () => { reset(); if (currentStop === stop) currentStop = null; });
 }
@@ -655,9 +703,9 @@ if (!previewTracks.length || !hasNotes(previewTracks)) return;
 const btn = $("exportWav");
 const original = btn.textContent;
 btn.disabled = true;
-btn.textContent = "Rendering…";
+setBtnProgress(btn, "Rendering", 0);
 try {
-  const buffer = await renderTracks(previewTracks);
+  const buffer = await renderTracks(previewTracks, pct => setBtnProgress(btn, "Rendering", pct * 100));
   const blob = audioBufferToWav(buffer);
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -665,6 +713,7 @@ try {
   a.click();
   URL.revokeObjectURL(a.href);
 } finally {
+  btn.classList.remove("has-progress");
   btn.disabled = false;
   btn.textContent = original;
 }
