@@ -602,12 +602,15 @@ function setBtnProgress(btn, label, pct){
 const p = Math.max(0, Math.min(100, Math.round(pct)));
 btn.classList.add("has-progress");
 const compact = btn.classList.contains("spk");
+// Width/height/fill are set as real attributes, not just CSS, so the ring stays a
+// small outline (not a giant filled disc -- SVG's UA default fill is black and its
+// default intrinsic size is ~300x150) even if styles.css hasn't loaded yet/at all.
 btn.innerHTML =
   (compact ? "" : `<span class="btn-label">${label}</span>`) +
   `<span class="btn-ring" style="--p:${p}">` +
-    `<svg viewBox="0 0 36 36" aria-hidden="true">` +
-      `<circle class="ring-bg" cx="18" cy="18" r="15.9155"/>` +
-      `<circle class="ring-fg" cx="18" cy="18" r="15.9155"/>` +
+    `<svg viewBox="0 0 36 36" width="24" height="24" aria-hidden="true">` +
+      `<circle class="ring-bg" cx="18" cy="18" r="15.9155" fill="none"/>` +
+      `<circle class="ring-fg" cx="18" cy="18" r="15.9155" fill="none"/>` +
     `</svg>` +
     `<span class="btn-ring-pct">${p}</span>` +
   `</span>`;
